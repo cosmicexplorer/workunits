@@ -1,0 +1,19 @@
+[workspace]
+members                 = []
+default-members         = []
+resolver                = "2"
+
+[workspace.package]
+version                 = "0.0.0"
+authors                 = ["Danny McClanahan <dmcC2@hypnicjerk.ai>"]
+edition                 = "2021"
+license                 = "LGPL-3.0"
+
+keywords = []
+categories = []
+homepage = "https://github.com/cosmicexplorer/workunits"
+repository = "https://github.com/cosmicexplorer/workunits"
+
+[profile.release]
+strip                   = true
+lto                     = true
