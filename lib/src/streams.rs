@@ -71,6 +71,7 @@ pub mod mux {
   use indexmap::{IndexMap, IndexSet};
   use log::debug;
   use parking_lot::RwLock;
+  use rayon::prelude::*;
 
   use std::{
     collections::VecDeque,
@@ -233,7 +234,7 @@ pub mod mux {
       /* A Bytes is cheaply cloneable, so it can be sent to all teed outputs
        * without additional copies. */
       let buf = Bytes::copy_from_slice(buf);
-      /* TODO: rayon/etc */
+      /* FIXME: expose an async version of this without the serial blocking! */
       for sender in self.tees.read().values() {
         #[allow(clippy::single_match_else)]
         match sender.send(buf.clone()) {
@@ -247,6 +248,8 @@ pub mod mux {
       Ok(buf.len())
     }
 
+    /// We have no concept of a "flush" for this unseekable stream, as we have
+    /// no internal buffering.
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
   }
 
@@ -297,15 +300,11 @@ pub mod mux {
       }
     }
 
-    fn find_matching_writers<'a>(
-      &'a self,
-      query: &'a Query,
-    ) -> impl Iterator<Item=WriteStreamId>+'a {
-      /* TODO: rayon? */
+    fn find_matching_writers(&self, query: &Query) -> IndexSet<WriteStreamId> {
       /* TODO: use some caching to avoid a linear scan each time? */
       self
         .writers
-        .iter()
+        .par_iter()
         .filter_map(|(writer_id, WriterContext { name, .. })| {
           if query.matches(name) {
             Some(*writer_id)
@@ -313,6 +312,7 @@ pub mod mux {
             None
           }
         })
+        .collect()
     }
 
     pub(crate) fn add_new_listener(
@@ -321,9 +321,10 @@ pub mod mux {
       sender: mpsc::SyncSender<Payload>,
     ) -> ReadStreamId {
       let new_read_id = ReadStreamId::new();
+
       /* (1) Add all the write targets teeing to this read stream into the reverse
        * index. */
-      let write_targets: IndexSet<WriteStreamId> = self.find_matching_writers(&query).collect();
+      let write_targets = self.find_matching_writers(&query);
       assert!(self
         .listeners
         .insert(new_read_id, ListenerContext {
@@ -332,9 +333,9 @@ pub mod mux {
           live_inputs: Arc::new(RwLock::new(write_targets.clone())),
         })
         .is_none());
+
       /* (2) Add this read stream to all the write streams' tee outputs. */
-      /* TODO: rayon? */
-      for target in write_targets.into_iter() {
+      write_targets.into_par_iter().for_each(|target| {
         let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>> = self
           .writers
           .get(&target)
@@ -344,17 +345,19 @@ pub mod mux {
           .write()
           .insert(new_read_id, sender.clone())
           .is_none());
-      }
+      });
       new_read_id
     }
 
     pub(crate) fn remove_listener(&mut self, s: ReadStreamId) {
       let ListenerContext { live_inputs, .. } =
         self.listeners.remove(&s).expect("listener id not found");
+
       let final_inputs: IndexSet<WriteStreamId> = Arc::into_inner(live_inputs)
         .expect("should be the only handle to live_inputs data")
         .into_inner();
-      for target in final_inputs.into_iter() {
+
+      final_inputs.into_par_iter().for_each(|target| {
         let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>> = self
           .writers
           .get(&target)
@@ -364,16 +367,16 @@ pub mod mux {
           live_outputs.write().remove(&s).is_some(),
           "this writer was expected to have pointed to the reader to remove"
         );
-      }
+      });
     }
 
-    fn find_matching_listeners<'a>(
-      &'a self,
-      name: &'a Name,
-    ) -> impl Iterator<Item=(ReadStreamId, mpsc::SyncSender<Payload>)>+'a {
+    fn find_matching_listeners(
+      &self,
+      name: &Name,
+    ) -> IndexMap<ReadStreamId, mpsc::SyncSender<Payload>> {
       self
         .listeners
-        .iter()
+        .par_iter()
         .filter_map(|(listener_id, ListenerContext { query, sender, .. })| {
           if query.matches(name) {
             Some((*listener_id, sender.clone()))
@@ -381,12 +384,12 @@ pub mod mux {
             None
           }
         })
+        .collect()
     }
 
     pub(crate) fn add_new_writer(&mut self, name: Name) -> WriteStreamId {
       let new_write_id = WriteStreamId::new();
-      let current_listeners: IndexMap<ReadStreamId, mpsc::SyncSender<Payload>> =
-        self.find_matching_listeners(&name).collect();
+      let current_listeners = self.find_matching_listeners(&name);
       let listener_ids: Vec<_> = current_listeners.keys().cloned().collect();
 
       assert!(self
@@ -397,7 +400,7 @@ pub mod mux {
         })
         .is_none());
 
-      for target in listener_ids.into_iter() {
+      listener_ids.into_par_iter().for_each(|target| {
         let live_inputs: Arc<RwLock<IndexSet<WriteStreamId>>> = self
           .listeners
           .get(&target)
@@ -407,7 +410,7 @@ pub mod mux {
           live_inputs.write().insert(new_write_id),
           "this write target is new, so should not have been registered to any read targets yet",
         );
-      }
+      });
 
       new_write_id
     }
@@ -415,21 +418,23 @@ pub mod mux {
     pub(crate) fn remove_writer(&mut self, t: WriteStreamId) {
       let WriterContext { live_outputs, .. } =
         self.writers.remove(&t).expect("writer id not found");
-      /* Simply drop the senders, as they do not provide any explicit EOF signal. */
+
+      /* Simply drop the senders, as they do not expose any explicit EOF signal. */
       let final_outputs: IndexMap<ReadStreamId, _> = Arc::into_inner(live_outputs)
         .expect("should be the only handle to live_outputs data")
         .into_inner();
-      for target in final_outputs.into_keys() {
+
+      final_outputs.par_keys().for_each(|target| {
         let live_inputs: Arc<RwLock<IndexSet<WriteStreamId>>> = self
           .listeners
-          .get(&target)
+          .get(target)
           .map(|ListenerContext { live_inputs, .. }| live_inputs.clone())
           .expect("reader should exist");
         assert!(
           live_inputs.write().remove(&t),
           "this reader was expected to have pointed to the writer to remove"
         );
-      }
+      });
     }
 
     pub(crate) fn live_outputs_for_writer(
@@ -460,7 +465,7 @@ pub mod mux {
   /// listener.read_to_string(&mut msg).unwrap();
   ///
   /// assert!(&msg == "hey");
-  ///```
+  /// ```
   pub struct MuxHandle {
     mux: Arc<RwLock<StreamMux>>,
   }
@@ -534,8 +539,9 @@ mod test {
     let mut buf1 = [0u8; 10];
     listener1.read_exact(&mut buf1).unwrap();
     assert_eq!(&buf1, b"wowheywoah");
-    /* All matching listeners should receive a copy of all the data sent by matching writers while
-     * the listener was registered, in the exact same order. */
+    /* All matching listeners should receive a copy of all the data sent by
+     * matching writers while the listener was registered, in the exact same
+     * order. */
     let mut buf2 = [0u8; 7];
     listener2.read_exact(&mut buf2).unwrap();
     assert_eq!(&buf2, b"heywoah");

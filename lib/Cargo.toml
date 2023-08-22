@@ -16,7 +16,8 @@ description             = "A facility for subprocess tracing and output teeing."
 [dependencies]
 bytes                   = "1.4"
 displaydoc              = "0.2.4"
-indexmap                = "2"
+indexmap                = { version = "2", features = ["rayon"] }
 log                     = "0.4.20"
 parking_lot             = "0.12"
+rayon                   = "1.7"
 uuid                    = { version = "1.4", features = ["v4", "fast-rng"] }
