@@ -444,6 +444,23 @@ pub mod mux {
     }
   }
 
+  ///```
+  /// use workunits::streams::{indexing, mux::{self, ListenStream, Streamer}};
+  /// use std::io::{Read, Write};
+  ///
+  /// let mux_handle = mux::MuxHandle::new();
+  /// let query = indexing::Query("exactly-this-name".to_string());
+  /// let mut listener = mux_handle.open_listener(query);
+  /// let name = indexing::Name("exactly-this-name".to_string());
+  /// let mut writer = mux_handle.open_writer(name);
+  ///
+  /// writer.write_all(b"hey").unwrap();
+  /// listener.signal_end();
+  /// let mut msg: String = String::new();
+  /// listener.read_to_string(&mut msg).unwrap();
+  ///
+  /// assert!(&msg == "hey");
+  ///```
   pub struct MuxHandle {
     mux: Arc<RwLock<StreamMux>>,
   }
