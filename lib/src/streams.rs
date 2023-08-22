@@ -517,6 +517,8 @@ mod test {
     let mut buf1 = [0u8; 10];
     listener1.read_exact(&mut buf1).unwrap();
     assert_eq!(&buf1, b"wowheywoah");
+    /* All matching listeners should receive a copy of all the data sent by matching writers while
+     * the listener was registered, in the exact same order. */
     let mut buf2 = [0u8; 7];
     listener2.read_exact(&mut buf2).unwrap();
     assert_eq!(&buf2, b"heywoah");

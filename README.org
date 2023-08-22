@@ -3,11 +3,11 @@
 
 A cross-language facility for [[subprocess tracing]] and [[output teeing]].
 
-* output teeing [0/3]
-- [ ] establish a (parallelizable) centralized stream reader/writer interface: [0/2]
-  - [ ] named datatypes :: if the same type of output is being written, make it clear
+* output teeing [1/3]
+- [-] establish a (parallelizable) centralized stream reader/writer interface: [1/2]
+  - [X] named datatypes :: if the same type of output is being written, make it clear
   - [ ] recursive namespace prefixes :: namespaces imply lifetimes (?)
-- [ ] figure out how to store tee'd outputs during the run /minimize write latency/
+- [X] figure out how to store tee'd outputs during the run /minimize write latency/
 - [ ] create a <<query language>> for tee'd outputs
 
 * subprocess tracing [0/2]
