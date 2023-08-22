@@ -48,3 +48,4 @@
 #![allow(clippy::mutex_atomic)]
 
 pub mod streams;
+pub(crate) mod interns;

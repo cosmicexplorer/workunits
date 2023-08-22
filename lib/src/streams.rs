@@ -31,14 +31,16 @@ pub(crate) mod referencing {
 pub mod indexing {
   use displaydoc::Display;
 
+  pub type MatchResult = bool;
+
   pub trait Matches {
     type Key;
-    fn matches(&self, key: &Self::Key) -> bool;
+    fn matches(&self, key: &Self::Key) -> MatchResult;
   }
 
   /* TODO: enable namespacing/prefixing/tagging. */
   /// <stream name: {0}>
-  #[derive(Clone, Eq, PartialEq, Debug, Display)]
+  #[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Display)]
   pub struct Name(pub String);
 
   impl Name {
@@ -46,7 +48,7 @@ pub mod indexing {
   }
 
   /// <stream name query: {0}>
-  #[derive(Clone, Eq, PartialEq, Debug, Display)]
+  #[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Display)]
   pub struct Query(pub String);
 
   impl Query {
@@ -57,8 +59,54 @@ pub mod indexing {
     type Key = Name;
 
     /* TODO: make this match more complex expressions, etc. */
-    fn matches(&self, name: &Name) -> bool { self.0 == name.0 }
+    fn matches(&self, name: &Name) -> MatchResult { self.0 == name.0 }
   }
+
+  /* pub(crate) mod caching { */
+  /*   use super::Matches; */
+  /*   use crate::interns::{self, InternHandle, InternTable}; */
+
+  /*   macro_rules! interned_handle { */
+  /*     ($name:ident) => { */
+  /*       #[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Debug)] */
+  /*       pub(crate) struct $name(usize); */
+
+  /*       impl InternHandle for $name {} */
+
+  /*       impl From<usize> for $name { */
+  /*         fn from(x: usize) -> Self { Self(x) } */
+  /*       } */
+  /*     }; */
+  /*   } */
+
+  /*   interned_handle![InternedQuery]; */
+  /*   interned_handle![InternedName]; */
+
+  /*   #[derive(Clone, Debug)] */
+  /*   pub struct QueryMatchIndex<Name, Query> { */
+  /*     index: IndexMap<Query, IndexSet<Name>>, */
+  /*     reverse: IndexMap<Name, IndexSet<Query>>, */
+  /*   } */
+
+  /*   impl Default for QueryMatchIndex { */
+  /*     fn default() -> Self { */
+  /*       Self { */
+  /*         index: IndexMap::new(), */
+  /*         reverse: IndexMap::new(), */
+  /*       } */
+  /*     } */
+  /*   } */
+
+  /*   impl<Name, Query> QueryMatchIndex<Name, Query> */
+  /*   where */
+  /*     Name: Hash+Eq+Copy, */
+  /*     Query: Hash+Eq+Matches<Key=Name>+Copy, */
+  /*   { */
+  /*     pub fn evaluate_match(&mut self, query: Query, name: Name) -> MatchResult { */
+  /*       let matching_names = self.index.entry(query).or_insert_with(IndexSet::new); */
+  /*     } */
+  /*   } */
+  /* } */
 }
 
 pub mod mux {
