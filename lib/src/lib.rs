@@ -48,7 +48,6 @@
 #![allow(clippy::mutex_atomic)]
 
 use async_trait::async_trait;
-use uuid::Uuid;
 
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -68,15 +67,6 @@ pub struct StreamSpec {
   pub content_type: ContentType,
 }
 
-
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub struct StreamId(Uuid);
-
-impl StreamId {
-  pub fn new() -> Self { Self(Uuid::new_v4()) }
-}
-
-
 #[derive(Clone, Debug)]
 pub struct NamespacedStreamName {
   pub parents: Vec<StreamTypeName>,
@@ -94,14 +84,24 @@ pub trait A {
   /// Register an atomic stream type by name and content.
   fn register_stream_type(&mut self, spec: StreamSpec);
   /// Anything written to this stream is teed to all matching listeners.
+  ///
+  /// If provided, `parent` must point to another "live" write stream (one that
+  /// hasn't been closed).
   fn open_workunit_write_stream(
     &mut self,
     type_name: StreamTypeName,
-    parent: Option<StreamId>,
-  ) -> (StreamId, WriteStreamType);
-  /// When closed, this stream is removed from the tee listeners for all matching streams.
-  fn listen_to_joined_stream(&mut self, name: NamespacedStreamName) -> ReadStreamType;
+    parent: Option<WriteStreamId>,
+  ) -> (WriteStreamId, WriteStreamType);
+  /// When closed, this stream is removed from the tee listeners for all
+  /// matching streams.
+  fn listen_to_joined_stream(
+    &mut self,
+    name: NamespacedStreamName,
+  ) -> (ReadStreamId, ReadStreamType);
 }
+
+
+pub mod streams;
 
 
 pub fn f(x: usize) -> usize { x + 3 }

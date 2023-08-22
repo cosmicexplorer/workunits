@@ -15,4 +15,7 @@ description             = "A facility for subprocess tracing and output teeing."
 
 [dependencies]
 async-trait             = "0.1.73"
+displaydoc              = "0.2.4"
+indexmap                = "2"
+parking_lot             = "0.12.1"
 uuid                    = { version = "1.4.1", features = ["v4", "fast-rng"] }
