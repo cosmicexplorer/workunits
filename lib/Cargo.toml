@@ -1,0 +1,14 @@
+[package]
+name                    = "workunits"
+# TODO: what to set this at?
+# rust-version            = "1.70"
+version.workspace       = true
+authors.workspace       = true
+edition.workspace       = true
+license.workspace       = true
+
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+repository.workspace    = true
+description             = "A facility for subprocess tracing and output teeing."

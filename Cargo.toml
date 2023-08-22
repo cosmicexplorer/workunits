@@ -1,6 +1,10 @@
 [workspace]
-members                 = []
-default-members         = []
+members                 = [
+  "./lib",
+]
+default-members         = [
+  "./lib",
+]
 resolver                = "2"
 
 [workspace.package]
