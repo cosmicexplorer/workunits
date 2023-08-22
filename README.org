@@ -1,0 +1,17 @@
+#+TITLE: workunits
+#+STARTUP: showall
+
+A cross-language facility for [[subprocess tracing]] and [[output teeing]].
+
+* output teeing [0/3]
+- [ ] establish a (parallelizable) centralized stream reader/writer interface
+- [ ] figure out how to store tee'd outputs during the run /minimize write latency/
+- [ ] create a <<query language>> for tee'd outputs
+
+* subprocess tracing [0/2]
+- [ ] associate the write stream open/close events with timed "workunit" spans as RAII
+- [ ] integrate spans with ~tracing~ crate
+
+* License
+
+[[file:./LICENSE][LGPL 3.0 or any later version]].
