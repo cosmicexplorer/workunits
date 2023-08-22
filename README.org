@@ -14,6 +14,12 @@ A cross-language facility for [[subprocess tracing]] and [[output teeing]].
 - [ ] associate the write stream open/close events with timed "workunit" spans as RAII
 - [ ] integrate spans with the [[https://github.com/tokio-rs/tracing][~tracing~]] crate
 
+* production readiness [0/2]
+- [ ] testing [0/2]
+  - [ ] add proptest
+  - [ ] maybe other fuzz/generative testing /especially anything that tests parallel execution ordering/
+- [ ] complete docs
+
 * License
 
 [[file:./LICENSE][LGPL 3.0 or any later version]].
