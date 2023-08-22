@@ -14,7 +14,6 @@ repository.workspace    = true
 description             = "A facility for subprocess tracing and output teeing."
 
 [dependencies]
-async-trait             = "0.1"
 bytes                   = "1.4"
 displaydoc              = "0.2.4"
 indexmap                = "2"
