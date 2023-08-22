@@ -67,11 +67,15 @@ pub mod mux {
     referencing::{ReadStreamId, WriteStreamId},
   };
 
+  use bytes::Bytes;
   use indexmap::{IndexMap, IndexSet};
+  use log::debug;
   use parking_lot::RwLock;
 
   use std::{
-    io,
+    cmp,
+    collections::VecDeque,
+    io, mem,
     sync::{mpsc, Arc},
   };
 
@@ -80,7 +84,7 @@ pub mod mux {
     fn id(&self) -> Self::ID;
   }
 
-  pub type Payload = Vec<u8>;
+  pub type Payload = Bytes;
 
   pub trait ListenStream: StreamID+io::Read {}
 
@@ -99,6 +103,7 @@ pub mod mux {
   pub struct ListenMux {
     id: ReadStreamId,
     recv: mpsc::Receiver<Payload>,
+    remainder: VecDeque<u8>,
     index: Arc<RwLock<StreamMux>>,
   }
 
@@ -108,7 +113,12 @@ pub mod mux {
       recv: mpsc::Receiver<Payload>,
       index: Arc<RwLock<StreamMux>>,
     ) -> Self {
-      Self { id, recv, index }
+      Self {
+        id,
+        recv,
+        remainder: VecDeque::new(),
+        index,
+      }
     }
   }
 
@@ -118,7 +128,47 @@ pub mod mux {
     fn id(&self) -> Self::ID { *self.id }
   }
 
-  impl io::Read for ListenMux {}
+  /// It's recommended to wrap this impl with a buffering reader.
+  impl io::Read for ListenMux {
+    /// A read() which may block and may not fill the whole buffer.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+      if buf.is_empty() {
+        return Ok(0);
+      }
+
+      let written = self.remainder.read(buf)?;
+      /* If we could at least partially satisfy the request from the buffer, return
+       * early. This does not signal EOF as long as n > 0 according to
+       * https://doc.rust-lang.org/nightly/std/io/trait.Read.html#tymethod.read. */
+      if written > 0 {
+        return Ok(written);
+      }
+      assert!(self.remainder.is_empty());
+
+      /* Otherwise, we wait to pull in anything (we *don't* wait to fill the whole
+       * buffer). */
+      match self.recv.recv() {
+        /* This occurs when all senders disconnect, which should never happen because we always
+         * cache an extra SyncSender in ListenerContext. */
+        Err(mpsc::RecvError) => unreachable!(),
+        Ok(payload) => {
+          assert!(!payload.is_empty());
+          self.remainder.extend(payload.into_iter());
+          /* We read from the beginning of buf because we early returned if we had
+           * already written any bytes to buf earlier. */
+          let written = self.remainder.read(buf)?;
+          /* We checked that buf and payload are non-empty, so this should always be
+           * true. Any nonzero value is acceptable for a read()
+           * implementation without implicitly signaling EOF. */
+          assert!(written > 0);
+          /* self.remainder may or may not be empty at this point (either is allowed). */
+          Ok(written)
+        },
+      }
+    }
+  }
+
+  impl ListenStream for ListenMux {}
 
   impl Drop for ListenMux {
     fn drop(&mut self) { self.index.write().remove_listener(self.id()); }
@@ -146,8 +196,46 @@ pub mod mux {
     fn id(&self) -> Self::ID { *self.id }
   }
 
+  /// It's recommended to wrap this in a buffered writer as well to work around
+  /// blocking.
+  impl io::Write for WriteMux {
+    /// A write() which always succeeds in full, but may block when writing to
+    /// bounded channels.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+      if buf.is_empty() {
+        return Ok(0);
+      }
+
+      /* A Bytes is cheaply cloneable, so it can be sent to all teed outputs
+       * without additional copies. */
+      let buf = Bytes::copy_from_slice(buf);
+      /* TODO: rayon/etc */
+      for sender in self.tees.read().values() {
+        match sender.send(buf.clone()) {
+          Ok(()) => (),
+          /* This only occurs if the receiver has hung up in between when we read from self.tees
+           * and this .send() call (see https://doc.rust-lang.org/std/sync/mpsc/struct.SendError.html). In this case, we log that this occurred in case it signal an
+           * issue but otherwise ignore it. */
+          Err(mpsc::SendError(_)) => debug!("receiver disconnected, which is fine"),
+        }
+      }
+      Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+  }
+
+  impl WriteStream for WriteMux {}
+
   impl Drop for WriteMux {
-    fn drop(&mut self) { self.index.write().remove_writer(self.id()); }
+    fn drop(&mut self) {
+      let Self { id, tees, index } = self;
+      /* NB: This needs to run before .remove_writer() to ensure that the StreamMux
+       * handle has the only Arc<RwLock<IndexMap<...>>> handle so it can call
+       * Arc::into_inner(). */
+      mem::drop(tees);
+      index.write().remove_writer(*id);
+    }
   }
 
   struct ListenerContext {
