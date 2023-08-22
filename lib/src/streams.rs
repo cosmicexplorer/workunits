@@ -75,7 +75,6 @@ pub mod mux {
   pub trait Streamer {
     type Listener;
     type Query: Matches<Key=Self::Name>;
-
     fn open_listener(&mut self, query: Self::Query) -> Self::Listener;
     fn close_listener(&mut self, listener: Self::Listener);
 
@@ -116,7 +115,7 @@ pub mod mux {
         })
     }
 
-    pub fn add_new_listener(&mut self, query: Query) -> ReadStreamId {
+    fn add_new_listener(&mut self, query: Query) -> ReadStreamId {
       let new_read_id = ReadStreamId::new();
       /* (1) Add all the write targets teeing to this read stream into the reverse
        * index. */
@@ -146,7 +145,7 @@ pub mod mux {
       new_read_id
     }
 
-    pub fn remove_listener(&mut self, s: ReadStreamId) {
+    fn remove_listener(&mut self, s: ReadStreamId) {
       let (_, writer_streams) = self.listeners.remove(&s).expect("listener id not found");
       let writer_streams: IndexSet<WriteStreamId> = Arc::into_inner(writer_streams)
         .expect("should be the only handle to writer_streams data")
@@ -177,7 +176,7 @@ pub mod mux {
         })
     }
 
-    pub fn add_new_writer(&mut self, name: Name) -> WriteStreamId {
+    fn add_new_writer(&mut self, name: Name) -> WriteStreamId {
       let new_write_id = WriteStreamId::new();
       let listeners: IndexSet<ReadStreamId> = self.find_matching_listeners(&name).collect();
       if let Some(_) = self.writers.insert(
@@ -203,7 +202,7 @@ pub mod mux {
       new_write_id
     }
 
-    pub fn remove_writer(&mut self, t: WriteStreamId) {
+    fn remove_writer(&mut self, t: WriteStreamId) {
       let (_, reader_streams) = self.writers.remove(&t).expect("writer id not found");
       let reader_streams: IndexSet<ReadStreamId> = Arc::into_inner(reader_streams)
         .expect("should be the only handle to reader_streams data")
@@ -220,5 +219,22 @@ pub mod mux {
         );
       }
     }
+  }
+
+  impl Streamer for StreamMux {
+    type Listener = ReadStreamId;
+    type Name = Name;
+    type Query = Query;
+    type Writer = WriteStreamId;
+
+    fn open_listener(&mut self, query: Self::Query) -> Self::Listener {
+      self.add_new_listener(query)
+    }
+
+    fn close_listener(&mut self, listener: Self::Listener) { self.remove_listener(listener); }
+
+    fn open_writer(&mut self, name: Self::Name) -> Self::Writer { self.add_new_writer(name) }
+
+    fn close_writer(&mut self, writer: Self::Writer) { self.remove_writer(writer); }
   }
 }
