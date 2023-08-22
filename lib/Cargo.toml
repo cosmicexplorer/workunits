@@ -12,3 +12,7 @@ categories.workspace    = true
 homepage.workspace      = true
 repository.workspace    = true
 description             = "A facility for subprocess tracing and output teeing."
+
+[dependencies]
+async-trait             = "0.1.73"
+uuid                    = { version = "1.4.1", features = ["v4", "fast-rng"] }

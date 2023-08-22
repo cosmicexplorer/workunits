@@ -47,6 +47,63 @@
 /* Arc<Mutex> can be more clear than needing to grok Orderings. */
 #![allow(clippy::mutex_atomic)]
 
+use async_trait::async_trait;
+use uuid::Uuid;
+
+
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct StreamTypeName(String);
+
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ContentType {
+  Text,
+  Binary,
+}
+
+
+#[derive(Clone)]
+pub struct StreamSpec {
+  pub type_name: StreamTypeName,
+  pub content_type: ContentType,
+}
+
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct StreamId(Uuid);
+
+impl StreamId {
+  pub fn new() -> Self { Self(Uuid::new_v4()) }
+}
+
+
+#[derive(Clone, Debug)]
+pub struct NamespacedStreamName {
+  pub parents: Vec<StreamTypeName>,
+  pub current: StreamTypeName,
+}
+
+impl NamespacedStreamName {
+  /// Interpret a `.`-delimited string as a sequence of parents and a final
+  /// current stream name.
+  pub fn parse_spec(spec: &str) -> Result<Self, String>;
+}
+
+
+pub trait A {
+  /// Register an atomic stream type by name and content.
+  fn register_stream_type(&mut self, spec: StreamSpec);
+  /// Anything written to this stream is teed to all matching listeners.
+  fn open_workunit_write_stream(
+    &mut self,
+    type_name: StreamTypeName,
+    parent: Option<StreamId>,
+  ) -> (StreamId, WriteStreamType);
+  /// When closed, this stream is removed from the tee listeners for all matching streams.
+  fn listen_to_joined_stream(&mut self, name: NamespacedStreamName) -> ReadStreamType;
+}
+
+
 pub fn f(x: usize) -> usize { x + 3 }
 
 #[cfg(test)]
