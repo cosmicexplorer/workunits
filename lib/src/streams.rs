@@ -37,6 +37,7 @@ use referencing::{ReadStreamId, WriteStreamId};
 pub mod indexing {
   use displaydoc::Display;
 
+  /* TODO: enable namespacing/prefixing/tagging. */
   /// <stream name: {0}>
   #[derive(Clone, Eq, PartialEq, Debug, Display)]
   pub struct StreamName(String);
@@ -52,6 +53,7 @@ pub mod indexing {
   impl Query {
     pub fn new(s: String) -> Self { Self(s) }
 
+    /* TODO: make this match more complex expressions, etc. */
     pub fn matches(&self, name: &StreamName) -> bool { self.0 == name }
   }
 }
@@ -119,7 +121,7 @@ impl Streamer {
   pub fn remove_listener(&mut self, s: ReadStreamId) {
     let (_, writer_streams) = self.listeners.remove(&s).expect("listener id not found");
     let writer_streams: IndexSet<WriteStreamId> = Arc::into_inner(writer_streams)
-      .expect("should be the only handle to this data")
+      .expect("should be the only handle to writer_streams data")
       .into_inner();
     for target in writer_streams.into_iter() {
       let readers: Arc<RwLock<IndexSet<ReadStreamId>>> = self
@@ -129,7 +131,7 @@ impl Streamer {
         .expect("writer should exist");
       assert!(
         readers.write().remove(&s),
-        "this reader was expected to have pointed to the writer to remove"
+        "this writer was expected to have pointed to the reader to remove"
       );
     }
   }
@@ -168,6 +170,24 @@ impl Streamer {
         write_targets.write().insert(t),
         "this write target is new, so should not have been registered to any read targets yet",
       );
+    }
+
+    pub fn remove_writer(&mut self, t: WriteStreamId) {
+      let (_, reader_streams) = self.writers.remove(&t).expect("writer id not found");
+      let reader_streams: IndexSet<ReadStreamId> = Arc::into_inner(reader_streams)
+        .expect("should be the only handle to reader_streams data")
+        .into_inner();
+      for target in reader_streams.into_iter() {
+        let writers: Arc<RwLock<IndexSet<WriteStreamId>>> = self
+          .listeners
+          .get(&target)
+          .map(|(_, writers)| writers.clone())
+          .expect("reader should exist");
+        assert!(
+          writers.write().remove(&s),
+          "this reader was expected to have pointed to the writer to remove"
+        );
+      }
     }
   }
 }
