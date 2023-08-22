@@ -31,30 +31,39 @@ pub mod referencing {
 pub mod indexing {
   use displaydoc::Display;
 
+  pub trait Matches {
+    type Key;
+    fn matches(&self, key: &Self::Key) -> bool;
+  }
+
   /* TODO: enable namespacing/prefixing/tagging. */
   /// <stream name: {0}>
   #[derive(Clone, Eq, PartialEq, Debug, Display)]
-  pub struct StreamName(String);
+  pub struct Name(pub String);
 
-  impl StreamName {
+  impl Name {
     pub fn new(s: String) -> Self { Self(s) }
   }
 
   /// <stream name query: {0}>
   #[derive(Clone, Eq, PartialEq, Debug, Display)]
-  pub struct Query(String);
+  pub struct Query(pub String);
 
   impl Query {
     pub fn new(s: String) -> Self { Self(s) }
+  }
+
+  impl Matches for Query {
+    type Key = Name;
 
     /* TODO: make this match more complex expressions, etc. */
-    pub fn matches(&self, name: &StreamName) -> bool { self.0 == name }
+    pub fn matches(&self, name: &Name) -> bool { self.0 == name.0 }
   }
 }
 
 pub mod mux {
   use super::{
-    indexing::{Query, StreamName},
+    indexing::{Matches, Name, Query},
     referencing::{ReadStreamId, WriteStreamId},
   };
 
@@ -63,15 +72,28 @@ pub mod mux {
 
   use std::sync::Arc;
 
-  pub struct Streamer {
+  pub trait Streamer {
+    type Listener;
+    type Query: Matches<Key=Self::Name>;
+
+    fn open_listener(&mut self, query: Self::Query) -> Self::Listener;
+    fn close_listener(&mut self, listener: Self::Listener);
+
+    type Writer;
+    type Name;
+    fn open_writer(&mut self, name: Self::Name) -> Self::Writer;
+    fn close_writer(&mut self, writer: Self::Writer);
+  }
+
+  pub struct StreamMux {
     /* This is the "reverse index", only used for bookkeeping when adding and removing r/w
      * streams. */
     listeners: IndexMap<ReadStreamId, (Query, Arc<RwLock<IndexSet<WriteStreamId>>>)>,
     /* This is used in write-heavy code paths for output teeing. */
-    writers: IndexMap<WriteStreamId, (StreamName, Arc<RwLock<IndexSet<ReadStreamId>>>)>,
+    writers: IndexMap<WriteStreamId, (Name, Arc<RwLock<IndexSet<ReadStreamId>>>)>,
   }
 
-  impl Streamer {
+  impl StreamMux {
     pub fn new() -> Self {
       Self {
         listeners: IndexMap::new(),
@@ -142,7 +164,7 @@ pub mod mux {
       }
     }
 
-    fn find_matching_listeners(&self, name: &StreamName) -> impl Iterator<Item=ReadStreamId> {
+    fn find_matching_listeners(&self, name: &Name) -> impl Iterator<Item=ReadStreamId> {
       self
         .listeners
         .iter()
@@ -155,7 +177,7 @@ pub mod mux {
         })
     }
 
-    pub fn add_new_writer(&mut self, name: StreamName) -> WriteStreamId {
+    pub fn add_new_writer(&mut self, name: Name) -> WriteStreamId {
       let new_write_id = WriteStreamId::new();
       let listeners: IndexSet<ReadStreamId> = self.find_matching_listeners(&name).collect();
       if let Some(_) = self.writers.insert(
