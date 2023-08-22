@@ -94,17 +94,18 @@ pub mod mux {
         })
     }
 
-    pub fn add_new_listener(&mut self, s: ReadStreamId, query: Query) {
+    pub fn add_new_listener(&mut self, query: Query) -> ReadStreamId {
+      let new_read_id = ReadStreamId::new();
       /* (1) Add all the write targets teeing to this read stream into the reverse
        * index. */
       let write_targets: IndexSet<WriteStreamId> = self.find_matching_writers(&query).collect();
-      if let Some(_) = self
-        .listeners
-        .insert(s, (query, Arc::new(RwLock::new(write_targets.clone()))))
-      {
+      if let Some(_) = self.listeners.insert(
+        new_read_id,
+        (query, Arc::new(RwLock::new(write_targets.clone()))),
+      ) {
         unreachable!(
           "assumed listener stream id {:?} was not already registered",
-          s
+          new_read_id
         );
       }
       /* (2) Add this read stream to all the write streams' tee outputs. */
@@ -116,10 +117,11 @@ pub mod mux {
           .map(|(_, read_targets)| read_targets.clone())
           .expect("writer stream id should already be registered");
         assert!(
-          read_targets.write().insert(s),
+          read_targets.write().insert(new_read_id),
           "this read target is new, so should not have been registered to any write targets yet"
         );
       }
+      new_read_id
     }
 
     pub fn remove_listener(&mut self, s: ReadStreamId) {
@@ -153,15 +155,16 @@ pub mod mux {
         })
     }
 
-    pub fn add_new_writer(&mut self, t: WriteStreamId, name: StreamName) {
+    pub fn add_new_writer(&mut self, name: StreamName) -> WriteStreamId {
+      let new_write_id = WriteStreamId::new();
       let listeners: IndexSet<ReadStreamId> = self.find_matching_listeners(&name).collect();
-      if let Some(_) = self
-        .writers
-        .insert(t, (name, Arc::new(RwLock::new(listeners.clone()))))
-      {
+      if let Some(_) = self.writers.insert(
+        new_write_id,
+        (name, Arc::new(RwLock::new(listeners.clone()))),
+      ) {
         unreachable!(
           "assumed writer stream id {:?} was not already registered",
-          t
+          new_write_id
         );
       }
       for target in listeners.into_iter() {
@@ -171,27 +174,28 @@ pub mod mux {
           .map(|(_, write_targets)| write_targets.clone())
           .expect("reader stream id should already be registered");
         assert!(
-          write_targets.write().insert(t),
+          write_targets.write().insert(new_write_id),
           "this write target is new, so should not have been registered to any read targets yet",
         );
       }
+      new_write_id
+    }
 
-      pub fn remove_writer(&mut self, t: WriteStreamId) {
-        let (_, reader_streams) = self.writers.remove(&t).expect("writer id not found");
-        let reader_streams: IndexSet<ReadStreamId> = Arc::into_inner(reader_streams)
-          .expect("should be the only handle to reader_streams data")
-          .into_inner();
-        for target in reader_streams.into_iter() {
-          let writers: Arc<RwLock<IndexSet<WriteStreamId>>> = self
-            .listeners
-            .get(&target)
-            .map(|(_, writers)| writers.clone())
-            .expect("reader should exist");
-          assert!(
-            writers.write().remove(&s),
-            "this reader was expected to have pointed to the writer to remove"
-          );
-        }
+    pub fn remove_writer(&mut self, t: WriteStreamId) {
+      let (_, reader_streams) = self.writers.remove(&t).expect("writer id not found");
+      let reader_streams: IndexSet<ReadStreamId> = Arc::into_inner(reader_streams)
+        .expect("should be the only handle to reader_streams data")
+        .into_inner();
+      for target in reader_streams.into_iter() {
+        let writers: Arc<RwLock<IndexSet<WriteStreamId>>> = self
+          .listeners
+          .get(&target)
+          .map(|(_, writers)| writers.clone())
+          .expect("reader should exist");
+        assert!(
+          writers.write().remove(&s),
+          "this reader was expected to have pointed to the writer to remove"
+        );
       }
     }
   }
