@@ -62,56 +62,100 @@ pub mod indexing {
     fn matches(&self, name: &Name) -> MatchResult { self.0 == name.0 }
   }
 
-  /* pub(crate) mod caching { */
-  /*   use super::Matches; */
-  /*   use crate::interns::{self, InternHandle, InternTable}; */
+  pub(crate) mod caching {
+    use super::{MatchResult, Matches};
+    use crate::interns::{Index, InternHandle, InternTable};
 
-  /*   macro_rules! interned_handle { */
-  /*     ($name:ident) => { */
-  /*       #[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Debug)] */
-  /*       pub(crate) struct $name(usize); */
+    use indexmap::IndexMap;
+    use parking_lot::RwLock;
 
-  /*       impl InternHandle for $name {} */
+    use std::{
+      borrow::{Borrow, Cow, ToOwned},
+      hash::Hash,
+      sync::Arc,
+    };
 
-  /*       impl From<usize> for $name { */
-  /*         fn from(x: usize) -> Self { Self(x) } */
-  /*       } */
-  /*     }; */
-  /*   } */
+    macro_rules! interned_handle {
+      ($name:ident) => {
+        #[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Debug)]
+        pub(crate) struct $name(usize);
 
-  /*   interned_handle![InternedQuery]; */
-  /*   interned_handle![InternedName]; */
+        impl InternHandle for $name {}
 
-  /*   #[derive(Clone, Debug)] */
-  /*   pub struct QueryMatchIndex<Name, Query> { */
-  /*     index: IndexMap<Query, IndexSet<Name>>, */
-  /*     reverse: IndexMap<Name, IndexSet<Query>>, */
-  /*   } */
+        impl From<usize> for $name {
+          fn from(x: usize) -> Self { Self(x) }
+        }
+      };
+    }
 
-  /*   impl Default for QueryMatchIndex { */
-  /*     fn default() -> Self { */
-  /*       Self { */
-  /*         index: IndexMap::new(), */
-  /*         reverse: IndexMap::new(), */
-  /*       } */
-  /*     } */
-  /*   } */
+    interned_handle![InternedQuery];
+    interned_handle![InternedName];
 
-  /*   impl<Name, Query> QueryMatchIndex<Name, Query> */
-  /*   where */
-  /*     Name: Hash+Eq+Copy, */
-  /*     Query: Hash+Eq+Matches<Key=Name>+Copy, */
-  /*   { */
-  /*     pub fn evaluate_match(&mut self, query: Query, name: Name) -> MatchResult { */
-  /*       let matching_names = self.index.entry(query).or_insert_with(IndexSet::new); */
-  /*     } */
-  /*   } */
-  /* } */
+    pub trait MatchIndex {
+      type Name: ToOwned<Owned=Self::Name>;
+      type Query: Matches<Key=Self::Name>+ToOwned<Owned=Self::Query>;
+      fn evaluate(&self, query: Cow<'_, Self::Query>, name: Cow<'_, Self::Name>) -> MatchResult;
+    }
+
+    #[derive(Copy, Clone, Eq, PartialEq, Hash)]
+    struct CacheKey(InternedQuery, InternedName);
+
+    #[derive(Clone)]
+    pub struct QueryMatchIndex<Name, Query> {
+      names: Index<Name, InternedName>,
+      queries: Index<Query, InternedQuery>,
+      cached: Arc<RwLock<IndexMap<CacheKey, MatchResult>>>,
+    }
+
+    impl<Name, Query> QueryMatchIndex<Name, Query> {
+      pub fn new() -> Self {
+        Self {
+          names: Index::new(),
+          queries: Index::new(),
+          cached: Arc::new(RwLock::new(IndexMap::new())),
+        }
+      }
+    }
+
+    impl<Name, Query> MatchIndex for QueryMatchIndex<Name, Query>
+    where
+      Name: Hash+Eq+ToOwned<Owned=Name>,
+      Query: Hash+Eq+ToOwned<Owned=Query>+Matches<Key=Name>,
+    {
+      type Name = Name;
+      type Query = Query;
+
+      fn evaluate(&self, query: Cow<'_, Self::Query>, name: Cow<'_, Self::Name>) -> MatchResult {
+        /* (1) Try to retrieve the value from the cache without cloning the Cows. */
+        if let Some(query_id) = self
+          .queries
+          .intern_soft(query.borrow()) &&
+          let Some(name_id) = self.names.intern_soft(name.borrow()) &&
+          let Some(cached_result) = self.cached.read().get(&CacheKey(query_id, name_id))
+        {
+          return *cached_result;
+        }
+
+        /* (2) Ensure both components are interned, check if the cache was filled in
+         * the meantime, then fill it if not. */
+        let query_id = self.queries.intern(query.clone());
+        let name_id = self.names.intern(name.clone());
+        *self
+          .cached
+          .write()
+          .entry(CacheKey(query_id, name_id))
+          .or_insert_with(|| query.matches(name.borrow()))
+      }
+    }
+  }
 }
 
 pub mod mux {
   use super::{
-    indexing::{Matches, Name, Query},
+    indexing::{
+      caching::{MatchIndex, QueryMatchIndex},
+      Matches, Name, Query,
+    },
     referencing::{ReadStreamId, WriteStreamId},
   };
 
@@ -122,6 +166,7 @@ pub mod mux {
   use rayon::prelude::*;
 
   use std::{
+    borrow::Cow,
     collections::VecDeque,
     hash::Hash,
     io, mem,
@@ -338,6 +383,7 @@ pub mod mux {
     listeners: IndexMap<ReadStreamId, ListenerContext>,
     /* This is used in write-heavy code paths for output teeing. */
     writers: IndexMap<WriteStreamId, WriterContext>,
+    query_match_index: QueryMatchIndex<Name, Query>,
   }
 
   impl StreamMux {
@@ -345,6 +391,7 @@ pub mod mux {
       Self {
         listeners: IndexMap::new(),
         writers: IndexMap::new(),
+        query_match_index: QueryMatchIndex::new(),
       }
     }
 
@@ -354,7 +401,10 @@ pub mod mux {
         .writers
         .par_iter()
         .filter_map(|(writer_id, WriterContext { name, .. })| {
-          if query.matches(name) {
+          if self
+            .query_match_index
+            .evaluate(Cow::Borrowed(query), Cow::Borrowed(name))
+          {
             Some(*writer_id)
           } else {
             None
@@ -426,7 +476,10 @@ pub mod mux {
         .listeners
         .par_iter()
         .filter_map(|(listener_id, ListenerContext { query, sender, .. })| {
-          if query.matches(name) {
+          if self
+            .query_match_index
+            .evaluate(Cow::Borrowed(query), Cow::Borrowed(name))
+          {
             Some((*listener_id, sender.clone()))
           } else {
             None
@@ -437,6 +490,7 @@ pub mod mux {
 
     pub(crate) fn add_new_writer(&mut self, name: Name) -> WriteStreamId {
       let new_write_id = WriteStreamId::new();
+
       let current_listeners = self.find_matching_listeners(&name);
       let listener_ids: Vec<_> = current_listeners.keys().cloned().collect();
 

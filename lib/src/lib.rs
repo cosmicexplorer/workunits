@@ -14,6 +14,8 @@
  * or correctness of the code. */
 // #![warn(missing_docs)]
 
+/* TODO: these can be removed, i guess... */
+#![feature(let_chains)]
 /* Note: run clippy with: rustup run nightly cargo-clippy! */
 #![deny(unsafe_code)]
 /* Ensure any doctest warnings fails the doctest! */
@@ -47,5 +49,5 @@
 /* Arc<Mutex> can be more clear than needing to grok Orderings. */
 #![allow(clippy::mutex_atomic)]
 
-pub mod streams;
 pub(crate) mod interns;
+pub mod streams;

@@ -68,7 +68,7 @@ pub trait InternTable {
   type Handle: InternHandle;
 
   fn intern_soft(&self, v: &Self::Value) -> Option<Self::Handle>;
-  fn intern(&self, v: &Cow<'_, Self::Value>) -> Self::Handle;
+  fn intern(&self, v: Cow<'_, Self::Value>) -> Self::Handle;
 }
 
 #[derive(Clone)]
@@ -99,7 +99,7 @@ where
     self.inner.read().intern_soft(v)
   }
 
-  fn intern(&self, v: &Cow<'_, Self::Value>) -> Self::Handle {
+  fn intern(&self, v: Cow<'_, Self::Value>) -> Self::Handle {
     /* Upgradable reads are mutually exclusive with other upgradable reads (see
      * https://morestina.net/blog/1739/upgradable-parking_lotrwlock-might-not-be-what-you-expect),
      * so we expose .intern_soft() to keep the fast path when applicable. */
@@ -107,7 +107,7 @@ where
     if let Some(handle) = read_guard.intern_soft(v.borrow()) {
       return handle;
     }
-    RwLockUpgradableReadGuard::<'_, _, _>::upgrade(read_guard).intern_hard(v.clone().into_owned())
+    RwLockUpgradableReadGuard::<'_, _, _>::upgrade(read_guard).intern_hard(v.into_owned())
   }
 }
 
@@ -135,13 +135,13 @@ mod test {
     let name1 = Name("asdf".to_string());
     let name2 = Name("bbb".to_string());
 
-    let id1 = index.intern(&Cow::Owned(name1.clone()));
-    let id_ref1 = index.intern(&Cow::Borrowed(&name1));
+    let id1 = index.intern(Cow::Owned(name1.clone()));
+    let id_ref1 = index.intern(Cow::Borrowed(&name1));
     assert!(id1 == id_ref1);
     let id_ref2 = index.intern_soft(&name1);
     assert!(Some(id1) == id_ref2);
     assert!(index.intern_soft(&name2).is_none());
-    let id2 = index.intern(&Cow::Owned(name2));
+    let id2 = index.intern(Cow::Owned(name2));
     assert!(id1 != id2);
   }
 }
