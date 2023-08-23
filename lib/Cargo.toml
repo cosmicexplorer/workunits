@@ -15,9 +15,13 @@ description             = "A facility for subprocess tracing and output teeing."
 
 [dependencies]
 bytes                   = "1.4"
-displaydoc              = "0.2.4"
+displaydoc.workspace    = true
 indexmap                = { version = "2", features = ["rayon"] }
 log                     = "0.4.20"
 parking_lot             = "0.12"
 rayon                   = "1.7"
+tokio                   = { workspace = true, features = ["sync"] }
 uuid                    = { version = "1.4", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+tokio                   = { workspace = true, features = ["macros", "io-util", "rt"] }

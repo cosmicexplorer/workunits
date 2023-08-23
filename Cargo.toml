@@ -19,6 +19,8 @@ homepage                = "https://github.com/cosmicexplorer/workunits"
 repository              = "https://github.com/cosmicexplorer/workunits"
 
 [workspace.dependencies]
+displaydoc              = "0.2.4"
+tokio                   = "1.29"
 
 [profile.release]
 strip                   = true

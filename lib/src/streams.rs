@@ -161,19 +161,24 @@ pub mod mux {
 
   use bytes::Bytes;
   use indexmap::{IndexMap, IndexSet};
-  use log::debug;
+  use log::{debug, error, warn};
   use parking_lot::RwLock;
   use rayon::prelude::*;
+  use tokio::{self, sync::mpsc};
 
   use std::{
     borrow::Cow,
+    cmp,
     collections::VecDeque,
     hash::Hash,
     io, mem,
+    pin::Pin,
     sync::{
       atomic::{AtomicBool, Ordering},
-      mpsc, Arc,
+      Arc,
     },
+    task::{Context, Poll},
+    time::{Duration, Instant},
   };
 
   pub trait StreamID {
@@ -183,11 +188,11 @@ pub mod mux {
 
   pub type Payload = Bytes;
 
-  pub trait ListenStream: StreamID+io::Read {
+  pub trait ListenStream: StreamID+io::Read+tokio::io::AsyncRead {
     fn signal_end(&self);
   }
 
-  pub trait WriteStream: StreamID+io::Write {}
+  pub trait WriteStream: StreamID+io::Write+tokio::io::AsyncWrite {}
 
   pub trait Streamer {
     type Listener: ListenStream;
@@ -252,9 +257,9 @@ pub mod mux {
         match self.recv.try_recv() {
           /* This occurs when all senders disconnect, which should never happen because we always
            * cache an extra SyncSender in ListenerContext. */
-          Err(mpsc::TryRecvError::Disconnected) => unreachable!(),
+          Err(mpsc::error::TryRecvError::Disconnected) => unreachable!(),
           /* If we've been signalled that it's all empty, then we can signal EOF. */
-          Err(mpsc::TryRecvError::Empty) => {
+          Err(mpsc::error::TryRecvError::Empty) => {
             return Ok(0);
           },
           Ok(payload) => payload,
@@ -262,11 +267,11 @@ pub mod mux {
       } else {
         /* Otherwise, we wait to pull in anything (we *don't* wait to fill the whole
          * buffer). */
-        match self.recv.recv() {
+        match self.recv.blocking_recv() {
           /* This occurs when all senders disconnect, which should never happen because we always
            * cache an extra SyncSender in ListenerContext. */
-          Err(mpsc::RecvError) => unreachable!(),
-          Ok(payload) => payload,
+          None => unreachable!(),
+          Some(payload) => payload,
         }
       };
       assert!(!payload.is_empty());
@@ -284,6 +289,59 @@ pub mod mux {
     }
   }
 
+  impl tokio::io::AsyncRead for ListenMux {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+      if buf.remaining() == 0 {
+        return Poll::Ready(Ok(()));
+      }
+
+      let self_ref = Pin::into_inner(self);
+      let buffered_length_to_copy = cmp::min(buf.remaining(), self_ref.remainder.len());
+      if buffered_length_to_copy > 0 {
+        let copied: Vec<u8> = self_ref
+          .remainder
+          .drain(..buffered_length_to_copy)
+          .collect();
+        debug_assert!(copied.len() == buffered_length_to_copy);
+        buf.put_slice(&copied);
+        return Poll::Ready(Ok(()));
+      }
+      assert!(self_ref.remainder.is_empty());
+
+      let end_signal = self_ref.end_signal.load(Ordering::Acquire);
+      match self_ref.recv.try_recv() {
+        /* This occurs when all senders disconnect, which should never happen because we always
+         * cache an extra SyncSender in ListenerContext. */
+        Err(mpsc::error::TryRecvError::Disconnected) => unreachable!(),
+        Err(mpsc::error::TryRecvError::Empty) => {
+          if end_signal {
+            Poll::Ready(Ok(()))
+          } else {
+            Poll::Pending
+          }
+        },
+        Ok(payload) => {
+          assert!(!payload.is_empty());
+          self_ref.remainder.extend(payload);
+          let buffered_length_to_copy = cmp::min(buf.remaining(), self_ref.remainder.len());
+          assert!(buffered_length_to_copy > 0);
+          /* TODO: split off at slice lengths to avoid going through the iterator (?) */
+          let copied: Vec<u8> = self_ref
+            .remainder
+            .drain(..buffered_length_to_copy)
+            .collect();
+          debug_assert!(copied.len() == buffered_length_to_copy);
+          buf.put_slice(&copied);
+          Poll::Ready(Ok(()))
+        },
+      }
+    }
+  }
+
   impl ListenStream for ListenMux {
     fn signal_end(&self) { self.end_signal.store(true, Ordering::Release); }
   }
@@ -294,17 +352,23 @@ pub mod mux {
 
   pub struct WriteMux {
     id: WriteStreamId,
-    tees: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>>,
+    tees: Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>>,
+    remainder: Option<(Payload, Instant, IndexSet<ReadStreamId>)>,
     index: Arc<RwLock<StreamMux>>,
   }
 
   impl WriteMux {
     pub(crate) fn new(
       id: WriteStreamId,
-      tees: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>>,
+      tees: Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>>,
       index: Arc<RwLock<StreamMux>>,
     ) -> Self {
-      Self { id, tees, index }
+      Self {
+        id,
+        tees,
+        remainder: None,
+        index,
+      }
     }
   }
 
@@ -314,8 +378,6 @@ pub mod mux {
     fn id(&self) -> Self::ID { self.id }
   }
 
-  /// It's recommended to wrap this in a buffered writer as well to work around
-  /// blocking.
   impl io::Write for WriteMux {
     /// A write() which always succeeds in full, but may block when writing to
     /// bounded channels.
@@ -324,18 +386,26 @@ pub mod mux {
         return Ok(0);
       }
 
+      let tees = self.tees.read();
+      if tees.is_empty() {
+        /* If no outputs, then writes are a no-op. */
+        return Ok(buf.len());
+      }
+
       /* A Bytes is cheaply cloneable, so it can be sent to all teed outputs
        * without additional copies. */
       let buf = Bytes::copy_from_slice(buf);
-      /* FIXME: expose an async version of this without the serial blocking! */
-      for sender in self.tees.read().values() {
+      /* NB: Not a good candidate for rayon iteration as each element may block an
+       * arbitrary amount. */
+      for sender in tees.values() {
+        /* FIXME: not possible to send synchronously but with a max timeout. */
         #[allow(clippy::single_match_else)]
-        match sender.send(buf.clone()) {
-          Ok(()) => (),
-          /* This only occurs if the receiver has hung up in between when we read from self.tees
-           * and this .send() call (see https://doc.rust-lang.org/std/sync/mpsc/struct.SendError.html). In this case, we log that this occurred in case it signal an
-           * issue but otherwise ignore it. */
-          Err(mpsc::SendError(_)) => debug!("receiver disconnected, which is fine"),
+        if sender.blocking_send(buf.clone()).err().is_some() {
+          /* This only occurs if the receiver has hung up in between when we read from
+           * self.tees and this .send() call (see https://docs.rs/tokio/latest/tokio/sync/mpsc/error/enum.SendTimeoutError.html).
+           * In this case, we log that this occurred in case it signals an issue but
+           * otherwise ignore it. */
+          debug!("receiver disconnected, which is fine");
         }
       }
       Ok(buf.len())
@@ -346,11 +416,184 @@ pub mod mux {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
   }
 
+  pub const MAX_WRITE_WAIT: Duration = Duration::from_millis(100);
+
+  impl tokio::io::AsyncWrite for WriteMux {
+    fn poll_write(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+      if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+      }
+
+      let self_ref = Pin::into_inner(self);
+      let tees = self_ref.tees.read();
+      if tees.is_empty() {
+        /* If we had a remainder, kill it. We have no target streams now. */
+        if self_ref.remainder.take().is_some() {
+          warn!("non-empty remainder was deleted after output tees all disappeared");
+        }
+
+        /* If no outputs, then writes are a no-op. */
+        return Poll::Ready(Ok(buf.len()));
+      }
+
+      if let Some((buf, start_time, blocked_readers)) = self_ref.remainder.take() {
+        let blocked_readers: IndexSet<ReadStreamId> = blocked_readers
+          .into_par_iter()
+          .filter_map(|read_id| {
+            let sender = match tees.get(&read_id) {
+              Some(sender) => sender,
+              None => {
+                warn!(
+                  "remainder read id {:?} was deleted since last poll",
+                  read_id
+                );
+                return None;
+              },
+            };
+            sender.try_send(buf.clone()).err().and_then(|e| match e {
+              mpsc::error::TrySendError::Closed(_) => {
+                debug!("receiver disconnected, which is fine");
+                None
+              },
+              mpsc::error::TrySendError::Full(_) => Some(read_id),
+            })
+          })
+          .collect();
+        if blocked_readers.is_empty() {
+          Poll::Ready(Ok(buf.len()))
+        } else if start_time.elapsed() > MAX_WRITE_WAIT {
+          error!(
+            "dropping buf sized {}; couldn't send to blocked readers {:?} in time",
+            buf.len(),
+            blocked_readers,
+          );
+          Poll::Ready(Ok(buf.len()))
+        } else {
+          debug!(
+            "AGAIN: couldn't send buf sized {} to blocked readers {:?}, pushing to remainder",
+            buf.len(),
+            blocked_readers
+          );
+          assert!(self_ref.remainder.is_none());
+          let _ = self_ref
+            .remainder
+            .insert((buf, start_time, blocked_readers));
+          Poll::Pending
+        }
+      } else {
+        let start_time = Instant::now();
+        let buf = Bytes::copy_from_slice(buf);
+        let blocked_readers: IndexSet<ReadStreamId> = tees
+          .par_iter()
+          .filter_map(|(read_id, sender)| {
+            sender.try_send(buf.clone()).err().and_then(|e| match e {
+              mpsc::error::TrySendError::Closed(_) => {
+                debug!("receiver disconnected, which is fine");
+                None
+              },
+              mpsc::error::TrySendError::Full(_) => Some(*read_id),
+            })
+          })
+          .collect();
+        if !blocked_readers.is_empty() {
+          debug!(
+            "couldn't send buf sized {} to blocked readers {:?}, pushing to remainder",
+            buf.len(),
+            blocked_readers
+          );
+          assert!(self_ref.remainder.is_none());
+          let _ = self_ref
+            .remainder
+            .insert((buf, start_time, blocked_readers));
+          Poll::Pending
+        } else {
+          Poll::Ready(Ok(buf.len()))
+        }
+      }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      let self_ref = Pin::into_inner(self);
+      let tees = self_ref.tees.read();
+      if tees.is_empty() {
+        /* If we had a remainder, kill it. We have no target streams now. */
+        if self_ref.remainder.take().is_some() {
+          warn!("non-empty remainder was deleted after output tees all disappeared");
+        }
+
+        /* If no outputs, then writes are a no-op. */
+        return Poll::Ready(Ok(()));
+      }
+
+      /* FIXME: remove this duplicated logic. Also add logic to drop a listener from the muxing if
+       * they keep reading too slowly. */
+      if let Some((buf, start_time, blocked_readers)) = self_ref.remainder.take() {
+        let blocked_readers: IndexSet<ReadStreamId> = blocked_readers
+          .into_par_iter()
+          .filter_map(|read_id| {
+            let sender = match tees.get(&read_id) {
+              Some(sender) => sender,
+              None => {
+                warn!(
+                  "remainder read id {:?} was deleted since last poll",
+                  read_id
+                );
+                return None;
+              },
+            };
+            sender.try_send(buf.clone()).err().and_then(|e| match e {
+              mpsc::error::TrySendError::Closed(_) => {
+                debug!("receiver disconnected, which is fine");
+                None
+              },
+              mpsc::error::TrySendError::Full(_) => Some(read_id),
+            })
+          })
+          .collect();
+        if blocked_readers.is_empty() {
+          Poll::Ready(Ok(()))
+        } else if start_time.elapsed() > MAX_WRITE_WAIT {
+          error!(
+            "dropping buf sized {}; couldn't send to blocked readers {:?} in time",
+            buf.len(),
+            blocked_readers,
+          );
+          Poll::Ready(Ok(()))
+        } else {
+          debug!(
+            "AGAIN: couldn't send buf sized {} to blocked readers {:?}, pushing to remainder",
+            buf.len(),
+            blocked_readers
+          );
+          assert!(self_ref.remainder.is_none());
+          let _ = self_ref
+            .remainder
+            .insert((buf, start_time, blocked_readers));
+          Poll::Pending
+        }
+      } else {
+        Poll::Ready(Ok(()))
+      }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      /* FIXME: do more work here if we retain more than a single frame across all
+       * targets in self.remainder. */
+      self.poll_flush(cx)
+    }
+  }
+
   impl WriteStream for WriteMux {}
 
   impl Drop for WriteMux {
     fn drop(&mut self) {
-      let Self { id, tees, index } = self;
+      let Self {
+        id, tees, index, ..
+      } = self;
       /* NB: This needs to run before .remove_writer() to ensure that the StreamMux
        * handle has the only Arc<RwLock<IndexMap<...>>> handle so it can call
        * Arc::into_inner(). */
@@ -364,7 +607,7 @@ pub mod mux {
     pub query: Query,
     /* This needs to be cloned every time a new reader comes online and matches the query, even
      * if there were no matching readers when the listener came online. */
-    pub sender: mpsc::SyncSender<Payload>,
+    pub sender: mpsc::Sender<Payload>,
     /* This is needed for cleanup when a listener is dropped. */
     pub live_inputs: Arc<RwLock<IndexSet<WriteStreamId>>>,
   }
@@ -374,7 +617,7 @@ pub mod mux {
     pub name: Name,
     /* This is accessed in the hot write path. If there are no matching listeners, the output
      * will be discarded (like redirecting to /dev/null). */
-    pub live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>>,
+    pub live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>>,
   }
 
   pub(crate) struct StreamMux {
@@ -416,7 +659,7 @@ pub mod mux {
     pub(crate) fn add_new_listener(
       &mut self,
       query: Query,
-      sender: mpsc::SyncSender<Payload>,
+      sender: mpsc::Sender<Payload>,
     ) -> ReadStreamId {
       let new_read_id = ReadStreamId::new();
 
@@ -434,7 +677,7 @@ pub mod mux {
 
       /* (2) Add this read stream to all the write streams' tee outputs. */
       write_targets.into_par_iter().for_each(|target| {
-        let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>> = self
+        let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>> = self
           .writers
           .get(&target)
           .map(|WriterContext { live_outputs, .. }| live_outputs.clone())
@@ -456,7 +699,7 @@ pub mod mux {
         .into_inner();
 
       final_inputs.into_par_iter().for_each(|target| {
-        let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>> = self
+        let live_outputs: Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>> = self
           .writers
           .get(&target)
           .map(|WriterContext { live_outputs, .. }| live_outputs.clone())
@@ -471,7 +714,7 @@ pub mod mux {
     fn find_matching_listeners(
       &self,
       name: &Name,
-    ) -> IndexMap<ReadStreamId, mpsc::SyncSender<Payload>> {
+    ) -> IndexMap<ReadStreamId, mpsc::Sender<Payload>> {
       self
         .listeners
         .par_iter()
@@ -542,7 +785,7 @@ pub mod mux {
     pub(crate) fn live_outputs_for_writer(
       &self,
       t: &WriteStreamId,
-    ) -> Arc<RwLock<IndexMap<ReadStreamId, mpsc::SyncSender<Payload>>>> {
+    ) -> Arc<RwLock<IndexMap<ReadStreamId, mpsc::Sender<Payload>>>> {
       let WriterContext { live_outputs, .. } = self
         .writers
         .get(t)
@@ -590,7 +833,7 @@ pub mod mux {
     type Writer = WriteMux;
 
     fn open_listener(&self, query: Self::Query) -> Self::Listener {
-      let (sender, receiver) = mpsc::sync_channel::<Payload>(CHANNEL_SIZE);
+      let (sender, receiver) = mpsc::channel::<Payload>(CHANNEL_SIZE);
       let id = self.mux.write().add_new_listener(query, sender);
       ListenMux::new(id, receiver, self.mux.clone())
     }
@@ -610,10 +853,10 @@ mod test {
     mux::{self, ListenStream, Streamer},
   };
 
-  use std::io::{Read, Write};
-
   #[test]
   fn interleaved() {
+    use std::io::{Read, Write};
+
     let mux_handle = mux::MuxHandle::new();
 
     let mut listener1 = mux_handle.open_listener(indexing::Query("asdf".to_string()));
@@ -655,6 +898,8 @@ mod test {
 
   #[test]
   fn signal_end() {
+    use std::io::{Read, Write};
+
     let mux_handle = mux::MuxHandle::new();
 
     let mut listener = mux_handle.open_listener(indexing::Query("asdf".to_string()));
@@ -667,6 +912,24 @@ mod test {
 
     let mut buf: Vec<u8> = Vec::new();
     listener.read_to_end(&mut buf).unwrap();
+    assert_eq!(&buf, b"wow");
+  }
+
+  #[tokio::test]
+  async fn async_streams() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mux_handle = mux::MuxHandle::new();
+
+    let mut listener = mux_handle.open_listener(indexing::Query("asdf".to_string()));
+
+    let mut writer = mux_handle.open_writer(indexing::Name("asdf".to_string()));
+    writer.write_all(b"wow").await.unwrap();
+
+    listener.signal_end();
+
+    let mut buf: Vec<u8> = Vec::new();
+    listener.read_to_end(&mut buf).await.unwrap();
     assert_eq!(&buf, b"wow");
   }
 }
